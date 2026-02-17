@@ -1,3 +1,7 @@
 msal>=1.24.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
+openai-agents>=0.9.0
+openai>=1.0.0
+pymupdf>=1.24.0
+python-dateutil>=2.8.0
