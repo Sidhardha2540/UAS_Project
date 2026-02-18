@@ -5,8 +5,11 @@ Uses Device Code flow for one-time auth.
 """
 
 import argparse
+import csv
+import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -23,6 +26,9 @@ SCOPES = ["User.Read", "Mail.Read", "Files.ReadWrite.All"]
 AUTHORITY = "https://login.microsoftonline.com/common" if SAVE_TO_ONEDRIVE else "https://login.microsoftonline.com/consumers"
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 TOKEN_CACHE_FILE = Path(__file__).parent / "token_cache.bin"
+PROCESSED_FILE = Path(__file__).parent / "beo_processed.json"
+# When True, skip attachments already in beo_processed.json (resume). When False, run from start every time.
+BEO_RESUME = os.getenv("BEO_RESUME", "").strip().lower() in ("1", "true", "yes")
 
 
 def get_token() -> str:
@@ -83,7 +89,7 @@ def fetch_inbox_messages(access_token: str, include_id: bool = False) -> list[di
     )
     all_messages = []
 
-    with httpx.Client() as client:
+    with httpx.Client(timeout=60.0) as client:
         while url:
             resp = client.get(url, headers=headers)
             resp.raise_for_status()
@@ -95,13 +101,18 @@ def fetch_inbox_messages(access_token: str, include_id: bool = False) -> list[di
 
 
 def list_attachments(access_token: str, message_id: str) -> list[dict]:
-    """List attachments for a message. Returns list of attachment dicts with id, name, contentType."""
+    """List all attachments for a message (handles pagination). Returns list of attachment dicts with id, name, contentType."""
     headers = {"Authorization": f"Bearer {access_token}"}
-    url = f"{GRAPH_BASE}/me/messages/{message_id}/attachments?$select=id,name,contentType"
-    with httpx.Client() as client:
-        resp = client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json().get("value", [])
+    url = f"{GRAPH_BASE}/me/messages/{message_id}/attachments?$select=id,name,contentType&$top=100"
+    all_attachments = []
+    with httpx.Client(timeout=30.0) as client:
+        while url:
+            resp = client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            all_attachments.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+    return all_attachments
 
 
 def download_attachment(access_token: str, message_id: str, attachment_id: str) -> bytes:
@@ -148,35 +159,96 @@ def print_messages(messages: list[dict]) -> None:
     print(f"{'='*60}")
 
 
+def _load_processed_set() -> set[tuple[str, str]]:
+    """Load set of (message_id, attachment_id) already processed."""
+    if not PROCESSED_FILE.exists():
+        return set()
+    try:
+        data = json.loads(PROCESSED_FILE.read_text(encoding="utf-8"))
+        items = data.get("processed") or []
+        return {(x["message_id"], x["attachment_id"]) for x in items}
+    except Exception:
+        return set()
+
+
+def _save_processed(processed_set: set[tuple[str, str]]) -> None:
+    """Persist processed set to beo_processed.json."""
+    items = [{"message_id": mid, "attachment_id": aid} for mid, aid in processed_set]
+    PROCESSED_FILE.write_text(json.dumps({"processed": items}, indent=2), encoding="utf-8")
+
+
+def _write_review_report(flagged: list[dict], report_dir: Path):
+    """Write a CSV report of flagged items for manual review. Returns path to the report file."""
+    if not flagged:
+        return
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = report_dir / f"beo_review_report_{timestamp}.csv"
+    with open(report_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["attachment_name", "beo_number", "beo_date", "folder_name_used", "reason"])
+        writer.writeheader()
+        writer.writerows(flagged)
+    return report_path
+
+
 def run_beo_pipeline(access_token: str) -> None:
-    """Fetch inbox, for each message with PDF attachments run BEO processor and save valid PDFs."""
+    """Fetch inbox and process PDFs. By default runs from start; set BEO_RESUME=true to skip already-processed."""
     from beo_processor import process_pdf
 
+    processed_set = _load_processed_set() if BEO_RESUME else set()
+    if BEO_RESUME:
+        print("Resume mode: skipping attachments already in beo_processed.json")
+    else:
+        print("Run from start: processing all PDF attachments in Inbox")
     messages = fetch_inbox_messages(access_token, include_id=True)
+    print(f"Fetched {len(messages)} message(s) from Inbox")
     saved = 0
     skipped = 0
+    already_processed = 0
+    flagged_for_review: list[dict] = []
+    total_pdfs = 0
     for msg in messages:
         msg_id = msg.get("id")
         if not msg_id:
             continue
         attachments = list_attachments(access_token, msg_id)
         pdfs = [a for a in attachments if is_pdf_attachment(a)]
+        total_pdfs += len(pdfs)
         for att in pdfs:
+            att_id = att.get("id")
+            if not att_id:
+                continue
+            if BEO_RESUME and (msg_id, att_id) in processed_set:
+                already_processed += 1
+                continue
             try:
-                content = download_attachment(access_token, msg_id, att["id"])
+                content = download_attachment(access_token, msg_id, att_id)
                 name = att.get("name") or "document.pdf"
-                path = process_pdf(content, name, access_token=access_token)
+                path, report_entry = process_pdf(content, name, access_token=access_token)
                 if path:
                     if isinstance(path, str):
                         print(f"Saved to OneDrive: {path}")
                     else:
                         print(f"Saved: {path}")
+                    if report_entry:
+                        flagged_for_review.append(report_entry)
+                        print(f"  [Flagged for review: {report_entry.get('reason', '?')}]")
                     saved += 1
+                    if BEO_RESUME:
+                        processed_set.add((msg_id, att_id))
+                        _save_processed(processed_set)
                 else:
                     skipped += 1
             except Exception as e:
                 print(f"Error processing {att.get('name', '?')}: {e}", file=sys.stderr)
-    print(f"BEO pipeline done. Saved: {saved}, skipped/invalid: {skipped}")
+    print(f"BEO pipeline done. PDFs found: {total_pdfs}, saved: {saved}, skipped/invalid: {skipped}" + (f", already processed: {already_processed}" if BEO_RESUME and already_processed else ""))
+    if total_pdfs == 0:
+        print("No PDF attachments found in Inbox. Add messages with PDF attachments and run again.")
+    if flagged_for_review:
+        report_dir = Path(__file__).parent
+        report_path = _write_review_report(flagged_for_review, report_dir)
+        if report_path is not None:
+            print(f"Review report ({len(flagged_for_review)} item(s)): {report_path}")
 
 
 def main() -> None:
