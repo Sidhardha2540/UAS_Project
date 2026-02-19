@@ -2,6 +2,7 @@
 Outlook Mail Reader - Fetches Inbox emails via Microsoft Graph API.
 Can list messages or process PDF attachments with BEO (Banquet Event Order) validation and folder save.
 Uses Device Code flow for one-time auth.
+Set BEO_RESUME=true in .env to skip already-processed attachments.
 """
 
 import argparse
